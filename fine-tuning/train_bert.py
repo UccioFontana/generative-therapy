@@ -1,78 +1,124 @@
-import torch  # Importing PyTorch library for model training and tensor operations
-import gc  # Importing the garbage collection module to manage memory
-import os  # Importing the OS library to interact with the file system
-from datasets import load_from_disk  # Importing the function to load datasets from disk
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, EarlyStoppingCallback  # Importing components for tokenization, model, training, and callbacks
-from sklearn.model_selection import train_test_split  # Importing train_test_split for dataset splitting
+# 📌 MONTA GOOGLE DRIVE (se vuoi salvare il modello lì)
+from google.colab import drive
+drive.mount('/content/drive')
 
-# 🔥 Clear the GPU cache to avoid memory errors
-torch.cuda.empty_cache()  # Clears unused GPU memory to avoid running out of memory
-gc.collect()  # Invokes garbage collection to free up memory
+# 🔓 ESTRAI IL FILE ZIP SE NECESSARIO
+import zipfile
+import os
 
-# 📌 Load the preprocessed dataset
-DATASET_PATH = os.path.abspath("../generative-therapy/processed_datasets")  # Get the absolute path to the preprocessed dataset
-dataset = load_from_disk(DATASET_PATH)  # Load the dataset from the disk
+zip_path = "/content/drive/MyDrive/ai_training/processed_datasets.zip"
+extract_path = "/content/drive/MyDrive/ai_training/processed_datasets"
 
-# 🔍 Check the structure of the dataset
-print("Dataset structure:", dataset)  # Prints the structure of the dataset to understand its format
+if not os.path.exists(extract_path):
+    print("📦 Estrazione del dataset ZIP...")
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_path)
+    print("✅ Estrazione completata!")
+else:
+    print("📂 Dataset già estratto.")
 
-# 📌 Split the dataset into training and testing sets (80% - 20%)
-train_size = int(len(dataset) * 0.8)  # Defines the size of the training set as 80% of the dataset
-train_indices, test_indices = train_test_split(range(len(dataset)), train_size=train_size, random_state=42)  # Splits the indices into training and testing
+# ✅ IMPOSTA IL PERCORSO DEL DATASET (modifica se necessario)
+DATASET_PATH = "/content/drive/MyDrive/ai_training/processed_datasets/processed_datasets"
 
-train_dataset = dataset.select(train_indices)  # Selects the training dataset using the generated indices
-test_dataset = dataset.select(test_indices)  # Selects the testing dataset using the generated indices
+# ✅ PERCORSO CHECKPOINT SU GOOGLE DRIVE
+CHECKPOINT_PATH = "/content/drive/MyDrive/fine_tuned_model_checkpoints"
 
-# 📌 Determine the number of classes
-NUM_LABELS = len(set(train_dataset["label"]))  # Determines the number of unique labels (classes) in the training set
+# 📦 INSTALLA I PACCHETTI NECESSARI
+!pip install -q datasets transformers scikit-learn
 
-# 📌 Check whether to use CUDA, MPS, or CPU
-device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"  # Sets the device to CUDA (GPU), MPS (Apple’s GPU), or CPU based on availability
+# 📥 IMPORTAZIONI
+import torch
+import gc
+import os
+from datasets import load_from_disk
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, EarlyStoppingCallback
+from sklearn.model_selection import train_test_split
 
-# 📌 Load the pre-trained model
-MODEL_NAME = "bert-base-uncased"  # The name of the pre-trained BERT model
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)  # Loads the tokenizer for the pre-trained BERT model
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=NUM_LABELS).to(device)  # Loads the pre-trained BERT model for sequence classification and moves it to the selected device
+# 🔥 LIBERA LA CACHE GPU
+torch.cuda.empty_cache()
+gc.collect()
 
-# 🔥 Enable gradient checkpointing to reduce memory consumption
-model.gradient_checkpointing_enable()  # Enables gradient checkpointing, a technique that saves memory during backpropagation
+# 📌 CARICA IL DATASET
+print(f"🔍 Caricamento del dataset da: {DATASET_PATH}")
+dataset = load_from_disk(DATASET_PATH)
 
-# 📌 Set the training arguments with smaller batch sizes and mixed precision
+# 👀 VERIFICA STRUTTURA
+print("📊 Struttura del dataset:", dataset)
+
+# 📌 SPLIT: 80% train, 20% test
+train_size = int(len(dataset) * 0.8)
+train_indices, test_indices = train_test_split(range(len(dataset)), train_size=train_size, random_state=42)
+train_dataset = dataset.select(train_indices)
+test_dataset = dataset.select(test_indices)
+
+# 📌 CALCOLA IL NUMERO DI CLASSI
+NUM_LABELS = len(set(train_dataset["label"]))
+
+# 💻 SCEGLI IL DISPOSITIVO
+device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+print(f"⚙️ Usando dispositivo: {device}")
+
+# 📌 MODELLO E TOKENIZER
+MODEL_NAME = "bert-base-uncased"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=NUM_LABELS).to(device)
+
+# 💡 ATTIVA GRADIENT CHECKPOINTING PER RIDURRE USO RAM GPU
+model.gradient_checkpointing_enable()
+
+# ✅ CONTROLLA SE ESISTE UN CHECKPOINT
+resume_checkpoint = None
+if os.path.isdir(CHECKPOINT_PATH) and len(os.listdir(CHECKPOINT_PATH)) > 0:
+    print("🔁 Checkpoint trovato! Riprendo da lì...")
+    # Find the latest checkpoint file
+    checkpoint_files = [f for f in os.listdir(CHECKPOINT_PATH) if f.startswith("checkpoint-")]
+    if checkpoint_files:
+        latest_checkpoint = max(checkpoint_files, key=lambda x: int(x.split("-")[1]))
+        resume_checkpoint = os.path.join(CHECKPOINT_PATH, latest_checkpoint)  # Use the latest checkpoint file
+    else:
+        print("⚠️ Checkpoint directory exists, but no checkpoint files found. Starting from scratch.")
+else:
+    print("🔁 Nessun checkpoint trovato, inizio da zero.")
+
+# ⚙️ ARGOMENTI DI TRAINING
 training_args = TrainingArguments(
-    output_dir="./results",  # Directory where the model and logs will be saved
-    evaluation_strategy="epoch",  # Evaluate the model at the end of each epoch
-    save_strategy="epoch",  # Save the model at the end of each epoch
-    per_device_train_batch_size=4,  # Set the batch size for training to 4 (reduced to save memory)
-    per_device_eval_batch_size=4,  # Set the batch size for evaluation to 4 (reduced to save memory)
-    num_train_epochs=3,  # Set the number of training epochs to 3 (reduced to speed up training)
-    weight_decay=0.01,  # Set weight decay for regularization
-    logging_dir="./logs",  # Directory for logging training information
-    logging_steps=10,  # Log training details every 10 steps
-    save_total_limit=2,  # Keep only the last 2 saved models to save disk space
-    fp16=True if device == "cuda" else False,  # Enable mixed precision (FP16) training only if a CUDA device is used
-    lr_scheduler_type="linear",  # Use a linear learning rate scheduler
-    warmup_steps=500,  # Number of warm-up steps to gradually increase the learning rate
-    load_best_model_at_end=True,  # Load the best model after training is complete
+    output_dir=CHECKPOINT_PATH,  # ✅ Salva checkpoint direttamente su Drive
+    evaluation_strategy="steps",
+    save_strategy="steps",
+    save_steps=20000,
+    eval_steps=20000,# ✅ Ogni 500 step (modificabile)
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=4,
+    num_train_epochs=3,
+    weight_decay=0.01,
+    logging_dir="./logs",
+    logging_steps=10,
+    save_total_limit=3,          # ✅ Tiene solo ultimi 3 checkpoint
+    fp16=True if device == "cuda" else False,
+    lr_scheduler_type="linear",
+    warmup_steps=500,
+    load_best_model_at_end=True,
+    report_to="none",
 )
 
-# 📌 Add Early Stopping callback
-early_stopping = EarlyStoppingCallback(early_stopping_patience=2)  # Stop training if the model does not improve after 2 epochs
+# 🛑 CALLBACK: EARLY STOPPING
+early_stopping = EarlyStoppingCallback(early_stopping_patience=2)
 
-# 📌 Create the Trainer
+# 🧠 CREAZIONE DEL TRAINER
 trainer = Trainer(
-    model=model,  # The model to train
-    args=training_args,  # Training arguments
-    train_dataset=train_dataset,  # The training dataset
-    eval_dataset=test_dataset,  # The testing dataset
-    tokenizer=tokenizer,  # The tokenizer used for preprocessing the text
-    callbacks=[early_stopping]  # Add the EarlyStoppingCallback to the trainer
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=test_dataset,
+    tokenizer=tokenizer,
+    callbacks=[early_stopping],
 )
 
-# 🚀 Start the training
-trainer.train()  # Starts the training process
+# 🚀 INIZIA L'ALLENAMENTO (con resume se c'è checkpoint)
+trainer.train(resume_from_checkpoint=resume_checkpoint)
 
-# 📌 Save the fine-tuned model
-model.save_pretrained("./fine_tuned_model")  # Save the trained model to the specified directory
-tokenizer.save_pretrained("./fine_tuned_model")  # Save the tokenizer to the specified directory
+# 💾 SALVA MODELLO FINE-TUNED SU DRIVE
+model.save_pretrained("/content/drive/MyDrive/fine_tuned_model")
+tokenizer.save_pretrained("/content/drive/MyDrive/fine_tuned_model")
 
-print("✅ Fine-tuning completed! The model is saved in './fine_tuned_model'")  # Prints a completion message indicating the model has been saved
+print("✅ Fine-tuning completato! Modello salvato in 'MyDrive/fine_tuned_model'")
