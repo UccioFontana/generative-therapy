@@ -12,7 +12,7 @@ The system allows a user to interact with an AI-powered virtual therapist inside
 ### 🔁 Workflow Summary
 
 1. **User Input (VR Environment)**:  
-   A user sends a message through a Unity-based VR interface.
+   A user sends a message through a local running interface.
 
 2. **Backend Communication (FastAPI)**:  
    The message is sent as a WebRequest to a local FastAPI server.
@@ -47,7 +47,6 @@ The system allows a user to interact with an AI-powered virtual therapist inside
 generative-therapy/
 │
 ├── main.py                  # FastAPI app with emotion detection and LLM response logic
-├── requirements.txt         # Required Python libraries
 ├── .env                     # Contains OpenAI API key (not committed)
 ├── README.md                # Project documentation
 ├── data-preprocessing/      # Scripts for preparing sentiment datasets
@@ -64,24 +63,18 @@ git clone https://github.com/UccioFontana/generative-therapy.git
 cd generative-therapy
 ```
 
-2. **Set Up Virtual Environment**
-```bash
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-```
-
-3. **Install Dependencies**
+2. **Install Dependencies**
 ```bash
 pip install -r requirements.txt
 ```
 
-4. **Configure API Keys**
+3. **Configure API Keys**
 Create a `.env` file with:
 ```
 OPENAI_API_KEY=your_openai_api_key
 ```
 
-5. **Download the Emotion Model**
+4. **Download the Emotion Model**
 Make sure the `BERT_sent_reg` directory (fine-tuned model) is in the project root or change the path in `main.py`.
 
 ---
@@ -129,7 +122,7 @@ This project is licensed under the MIT License. See `LICENSE` for details.
 
 ## 👤 Author
 
-Francesco Fontana  
+Eustachio Fontana  
 Feel free to connect via [GitHub](https://github.com/UccioFontana)
 
 ---
