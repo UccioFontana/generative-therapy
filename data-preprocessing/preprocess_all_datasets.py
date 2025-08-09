@@ -3,7 +3,7 @@
 Preprocessing coerente con la tesi:
 - Tassonomia unica: 28 classi (27 GoEmotions + 'neutral')
 - GoEmotions robusto agli split (train/validation/test o solo train)
-- DailyDialog rimappato su 28
+- DailyDialog (mirror OpenRL/daily_dialog) rimappato su 28, con schema robusto
 - Reddit MH rietichettato con weak labeling (teacher: SamLowe/roberta-base-go_emotions)
 - PII cleaning (email, telefono, @username, URL) con conteggio redazioni
 - Tokenizzazione max_length=128
@@ -24,6 +24,11 @@ from datasets import (
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
 from sklearn.model_selection import StratifiedShuffleSplit
+import torch
+print(torch.cuda.is_available())
+print(torch.cuda.get_device_name(0))  # Deve dare 'NVIDIA GeForce RTX 2080'
+
+
 
 # -----------------------
 # Config
@@ -38,6 +43,9 @@ REDDIT_CONF_THRESHOLD = 0.5        # soglia minima di confidenza (0.6-0.7 = più
 
 SEED = 42
 TEST_SIZE = 0.2
+
+# Mirror stabile di DailyDialog (lo "storico" può risultare deprecato/rotto)
+DD_DATASET_NAME = "OpenRL/daily_dialog"
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -116,32 +124,70 @@ def preprocess_goemotions(ds_split: Dataset) -> Dataset:
     return ds
 
 # -----------------------
-# DailyDialog
+# DailyDialog (robusto allo schema del mirror OpenRL)
 # -----------------------
 def preprocess_dailydialog(ds_split: Dataset) -> Dataset:
     """
-    Concatena i turni del dialogo e usa la moda delle emozioni 0..6 (se presenti).
-    Mappa su EMOTION_LABELS e default 'neutral' se manca.
+    Supporta varianti del dataset (es. OpenRL/daily_dialog):
+    - 'dialog' può essere lista di turni o stringa
+    - 'emotion' può essere lista di interi (con -1 come 'no emotion') o mancare
+    - Alcuni fork usano 'utterances', 'label' o 'labels'
+    - In assenza di etichette valide -> 'neutral'
     """
-    def to_text_and_label(x):
-        dialog = x.get("dialog", [])
-        text = " ".join(u for u in dialog if isinstance(u, str))
-        labels = x.get("emotion", [])
-        labels = [int(l) for l in labels if isinstance(l, (int, np.integer))]
+    keep_cols = [c for c in ds_split.column_names if c in ("dialog", "emotion", "utterances", "label", "labels")]
+    ds = ds_split.remove_columns([c for c in ds_split.column_names if c not in keep_cols])
 
-        label_dd = None
+    def to_text_and_label(x):
+        # --- testo ---
+        if "dialog" in x:
+            d = x["dialog"]
+        elif "utterances" in x:
+            d = x["utterances"]
+        else:
+            d = None
+
+        if isinstance(d, list):
+            text = " ".join(u for u in d if isinstance(u, str))
+        elif isinstance(d, str):
+            text = d
+        else:
+            text = ""
+
+        # --- emozioni grezze ---
+        if "emotion" in x:
+            raw_emotions = x["emotion"]
+        elif "label" in x:
+            raw_emotions = x["label"]
+        elif "labels" in x:
+            raw_emotions = x["labels"]
+        else:
+            raw_emotions = None
+
+        labels = []
+        if isinstance(raw_emotions, list):
+            # tipicamente lista di int 0..6 o -1
+            for el in raw_emotions:
+                if isinstance(el, (int, np.integer)) and el >= 0:
+                    labels.append(int(el))
+        elif isinstance(raw_emotions, (int, np.integer)) and raw_emotions >= 0:
+            labels = [int(raw_emotions)]
+        # altrimenti: nessuna etichetta valida -> neutral
+
+        # moda delle emozioni (0..6), mappa su nostra tassonomia
         if len(labels) > 0:
             vals, counts = np.unique(labels, return_counts=True)
             label_dd = int(vals[np.argmax(counts)])
+            label_name = DD_INT_TO_LABEL.get(label_dd, "neutral")
+        else:
+            label_name = "neutral"
 
-        label_name = DD_INT_TO_LABEL.get(label_dd, "neutral")
         y = LABEL2ID[label_name]
 
+        # PII cleaning
         text, red = clean_pii(text)
+
         return {"text": text, "label": int(y), "pii_redactions": int(red)}
 
-    keep_cols = [c for c in ds_split.column_names if c in ("dialog", "emotion")]
-    ds = ds_split.remove_columns([c for c in ds_split.column_names if c not in keep_cols])
     ds = ds.map(to_text_and_label)
     ds = ds.cast_column("label", Value("int64"))
     ds = ds.cast_column("text", Value("string"))
@@ -151,7 +197,6 @@ def preprocess_dailydialog(ds_split: Dataset) -> Dataset:
 # -----------------------
 # Reddit MH (weak labeling con teacher multi-label)
 # -----------------------
-
 def preprocess_reddit_with_teacher(
     ds_split: Dataset,
     teacher_model_name: str = REDDIT_TEACHER,
@@ -286,7 +331,7 @@ def stratified_split(ds: Dataset, test_size: float = TEST_SIZE, seed: int = SEED
 # Main
 # -----------------------
 def main():
-    print("🔽 Carico GoEmotions (raw) e DailyDialog…")
+    print("🔽 Carico GoEmotions (raw) e DailyDialog (mirror OpenRL)…")
     goemotions = load_dataset("go_emotions", "raw")
     print(f"   GoEmotions splits disponibili: {list(goemotions.keys())}")
 
@@ -305,8 +350,14 @@ def main():
     else:
         geo_full = concatenate_datasets(geo_parts)
 
-    dailydialog = load_dataset("daily_dialog", trust_remote_code=True)
-    print(f"   DailyDialog splits: {list(dailydialog.keys())}")
+    # DailyDialog dal mirror OpenRL
+    dailydialog = load_dataset(DD_DATASET_NAME)
+    print(f"   DailyDialog({DD_DATASET_NAME}) splits: {list(dailydialog.keys())}")
+    # Log utile per diagnosticare eventuali futuri cambi schema
+    try:
+        print("   Colonne DailyDialog(train):", dailydialog["train"].column_names)
+    except Exception:
+        pass
 
     dd_parts = []
     if "train" in dailydialog:

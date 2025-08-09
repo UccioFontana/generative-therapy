@@ -1,130 +1,291 @@
-# Mount Google Drive to access files (datasets, models, checkpoints) from your Drive account
-from google.colab import drive
-drive.mount('/content/drive')  # This mounts your Drive at /content/drive/MyDrive/
+# -*- coding: utf-8 -*-
+"""
+Training DeBERTa-v3-base senza 'neutral' + class weights (fix per Windows):
+- Filtra 'neutral' da train/val/test con num_proc=1
+- Tokenizza al volo se mancano input_ids/attention_mask
+- Mantiene solo {input_ids, attention_mask, labels}
+- Usa default_data_collator (batch già pad lato tokenizzazione)
+- Disabilita multiprocessing nei DataLoader
+"""
 
-# Import libraries for file handling and working with ZIP files
-import zipfile
 import os
+import json
+import math
+import numpy as np
+from typing import List
+from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.metrics import accuracy_score, f1_score
 
-# Define the path to the ZIP file containing the dataset on Google Drive
-zip_path = "/content/drive/MyDrive/ai_training/processed_datasets.zip"
-
-# Define the path where the dataset should be extracted
-extract_path = "/content/drive/MyDrive/ai_training/processed_datasets"
-
-# Check if the dataset has already been extracted to avoid redundant extraction
-if not os.path.exists(extract_path):
-    print("📦 Extracting dataset ZIP...")
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_path)  # Extract all contents of the ZIP file
-    print("✅ Extraction completed!")
-else:
-    print("📂 Dataset already extracted.")  # Inform the user if dataset is already present
-
-# Define the actual path to the HuggingFace-formatted dataset (saved using .save_to_disk)
-DATASET_PATH = "/content/drive/MyDrive/ai_training/processed_datasets/processed_datasets"
-
-# Path to save checkpoints during training (used by Hugging Face Trainer)
-CHECKPOINT_PATH = "/content/drive/MyDrive/fine_tuned_model_checkpoints"
-
-# Install necessary packages for NLP and training models using Hugging Face and scikit-learn
-!pip install -q datasets transformers scikit-learn
-
-# Import required Python libraries for training, memory management, and dataset handling
 import torch
-import gc
-import os
-from datasets import load_from_disk
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments, EarlyStoppingCallback
-from sklearn.model_selection import train_test_split
-
-# Clear the GPU cache to free up memory before training
-torch.cuda.empty_cache()
-gc.collect()
-
-# Load the dataset that was saved to disk in Hugging Face format
-print(f"🔍 Loading dataset from: {DATASET_PATH}")
-dataset = load_from_disk(DATASET_PATH)
-
-# Display dataset structure for verification (e.g., features, size)
-print("📊 Dataset structure:", dataset)
-
-# Split the dataset into training and testing sets (80% train, 20% test)
-train_size = int(len(dataset) * 0.8)
-train_indices, test_indices = train_test_split(range(len(dataset)), train_size=train_size, random_state=42)
-train_dataset = dataset.select(train_indices)
-test_dataset = dataset.select(test_indices)
-
-# Determine the number of unique class labels in the dataset (used to configure the model output)
-NUM_LABELS = len(set(train_dataset["label"]))
-
-# Select the best available hardware for training: CUDA (NVIDIA GPU), MPS (Apple GPU), or CPU
-device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-print(f"⚙️ Using device: {device}")
-
-# Define the base pretrained model and tokenizer to use (e.g., BERT)
-MODEL_NAME = "bert-base-uncased"
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)  # Load the tokenizer
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=NUM_LABELS).to(device)  # Load the model with the correct number of output labels
-
-# Enable gradient checkpointing to save GPU memory during training (trades speed for memory)
-model.gradient_checkpointing_enable()
-
-# Check if a previous checkpoint exists, and set resume_checkpoint to the latest one if available
-resume_checkpoint = None
-if os.path.isdir(CHECKPOINT_PATH) and len(os.listdir(CHECKPOINT_PATH)) > 0:
-    print("🔁 Checkpoint found! Resuming from the latest one...")
-    # Find all folders that match the Hugging Face checkpoint naming pattern
-    checkpoint_files = [f for f in os.listdir(CHECKPOINT_PATH) if f.startswith("checkpoint-")]
-    if checkpoint_files:
-        # Pick the checkpoint with the highest step number (latest)
-        latest_checkpoint = max(checkpoint_files, key=lambda x: int(x.split("-")[1]))
-        resume_checkpoint = os.path.join(CHECKPOINT_PATH, latest_checkpoint)
-    else:
-        print("⚠️ Checkpoint directory exists, but no valid checkpoint files were found.")
-else:
-    print("🔁 No checkpoint found, starting training from scratch.")
-
-# Define the training configuration, including output directory, batch size, epochs, and evaluation settings
-training_args = TrainingArguments(
-    output_dir=CHECKPOINT_PATH,                 # Directory to save checkpoints and final model
-    evaluation_strategy="steps",                # Evaluate every few steps
-    save_strategy="steps",                      # Save model checkpoints every few steps
-    save_steps=20000,                           # Save checkpoint every 20,000 steps
-    eval_steps=20000,                           # Evaluate the model every 20,000 steps
-    per_device_train_batch_size=4,              # Training batch size per GPU
-    per_device_eval_batch_size=4,               # Evaluation batch size per GPU
-    num_train_epochs=3,                         # Number of training epochs
-    weight_decay=0.01,                          # Apply weight decay to reduce overfitting
-    logging_dir="./logs",                       # Directory to save training logs
-    logging_steps=10,                           # Log metrics every 10 steps
-    save_total_limit=3,                         # Keep only the 3 most recent checkpoints
-    fp16=True if device == "cuda" else False,   # Enable mixed precision training if using CUDA
-    lr_scheduler_type="linear",                 # Use a linear learning rate schedule
-    warmup_steps=500,                           # Number of warmup steps for learning rate scheduler
-    load_best_model_at_end=True,                # Automatically load the best model when training ends
-    report_to="none",                           # Disable reporting to external services like WandB
+import torch.nn as nn
+from datasets import load_from_disk, Dataset, DatasetDict
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    Trainer,
+    TrainingArguments,
+    set_seed,
+    EarlyStoppingCallback,
+    default_data_collator,
 )
 
-# Define early stopping callback to prevent overfitting and stop training if validation doesn't improve
-early_stopping = EarlyStoppingCallback(early_stopping_patience=2)
+# =========================
+# Config
+# =========================
+DATASET_DIR = "processed_datasets"
+OUTPUT_DIR  = "DEBERTA_sent_reg_no_neutral"
+BASE_MODEL  = "microsoft/deberta-v3-base"
+SEED        = 42
 
-# Initialize the Hugging Face Trainer with the model, data, tokenizer, arguments, and callback
+BATCH_SIZE_TRAIN = 16
+BATCH_SIZE_EVAL  = 16
+NUM_EPOCHS       = 4
+LEARNING_RATE    = 2e-5
+WEIGHT_DECAY     = 0.01
+WARMUP_RATIO     = 0.1
+LOG_STEPS        = 50
+EVAL_STEPS       = 5000
+SAVE_STEPS       = 5000
+EARLY_STOP_PATIENCE = 5
+MAX_CLASS_WEIGHT = 4.0
+MAX_LENGTH       = 128
+
+# =========================
+# Device + seed
+# =========================
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🖥️  Device: {device}")
+set_seed(SEED)
+torch.backends.cudnn.benchmark = True if device == "cuda" else False
+
+# =========================
+# Dataset + labels
+# =========================
+if not os.path.isdir(DATASET_DIR):
+    raise FileNotFoundError(f"Dataset non trovato: {DATASET_DIR}")
+
+dsdict: DatasetDict = load_from_disk(DATASET_DIR)
+if not {"train", "test"}.issubset(dsdict.keys()):
+    raise RuntimeError(f"Split 'train' e 'test' mancanti in {DATASET_DIR}")
+
+labels_path = os.path.join(DATASET_DIR, "labels.json")
+with open(labels_path, "r", encoding="utf-8") as f:
+    labels_payload = json.load(f)
+
+all_labels: List[str] = labels_payload["labels"]
+
+# Filtra 'neutral'
+if "neutral" not in all_labels:
+    raise ValueError("'neutral' non trovato nelle label")
+print("❌ Rimuovo 'neutral' dal training/test...")
+non_neutral_labels = [lbl for lbl in all_labels if lbl != "neutral"]
+
+LABEL2ID = {lbl: i for i, lbl in enumerate(non_neutral_labels)}
+ID2LABEL = {i: lbl for lbl, i in LABEL2ID.items()}
+num_labels = len(non_neutral_labels)
+print(f"🔖 Classi usate: {num_labels} -> {list(non_neutral_labels)}")
+
+neutral_id = labels_payload["label2id"]["neutral"]
+
+def filter_neutral(ex):
+    return ex["label"] != neutral_id
+
+# FIX Windows: num_proc=1
+train_full: Dataset = dsdict["train"].filter(filter_neutral, num_proc=1)
+test_non_neutral: Dataset = dsdict["test"].filter(filter_neutral, num_proc=1)
+
+# =========================
+# Split stratificato per val
+# =========================
+y = [LABEL2ID[all_labels[lbl]] for lbl in train_full["label"]]
+idx = np.arange(len(y))
+sss = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=SEED)
+train_idx, val_idx = next(sss.split(idx, y))
+train_ds = train_full.select(train_idx.tolist())
+val_ds   = train_full.select(val_idx.tolist())
+
+# =========================
+# Remap labels e rinomina in 'labels'
+# =========================
+def remap_labels(example):
+    example["label"] = LABEL2ID[all_labels[example["label"]]]
+    return example
+
+train_ds = train_ds.map(remap_labels).rename_column("label", "labels")
+val_ds   = val_ds.map(remap_labels).rename_column("label", "labels")
+test_non_neutral = test_non_neutral.map(remap_labels).rename_column("label", "labels")
+
+# =========================
+# Tokenizer
+# =========================
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True)
+
+TEXT_CANDIDATES = ["text", "clean_text", "utterance"]
+
+def guess_text_field(columns):
+    for c in TEXT_CANDIDATES:
+        if c in columns:
+            return c
+    return None
+
+def need_tokenization(ds: Dataset) -> bool:
+    cols = set(ds.column_names)
+    return not {"input_ids", "attention_mask"}.issubset(cols)
+
+def tokenize_dataset(ds: Dataset, name: str) -> Dataset:
+    if not need_tokenization(ds):
+        print(f"✅ {name}: già tokenizzato (uso input_ids/attention_mask).")
+        return ds
+    text_col = guess_text_field(ds.column_names)
+    if text_col is None:
+        raise ValueError(
+            f"{name}: mancano input_ids/attention_mask e non trovo una colonna di testo. "
+            f"Colonne presenti: {ds.column_names}"
+        )
+    print(f"✍️  Tokenizzo {name} dal campo '{text_col}'...")
+    def tok_fn(batch):
+        enc = tokenizer(
+            batch[text_col],
+            truncation=True,
+            padding="max_length",
+            max_length=MAX_LENGTH,
+        )
+        return enc
+    keep = ["labels", text_col]
+    remove_cols = [c for c in ds.column_names if c not in keep]
+    ds = ds.map(tok_fn, batched=True, remove_columns=remove_cols)
+    keep2 = [c for c in ["input_ids", "attention_mask", "labels"] if c in ds.column_names]
+    ds = ds.remove_columns([c for c in ds.column_names if c not in keep2])
+    print(f"✅ {name}: tokenizzato. Colonne: {ds.column_names}")
+    return ds
+
+train_ds = tokenize_dataset(train_ds, "train")
+val_ds   = tokenize_dataset(val_ds, "val")
+test_non_neutral = tokenize_dataset(test_non_neutral, "test_no_neutral")
+
+# =========================
+# Torch format
+# =========================
+required_columns = ["input_ids", "attention_mask", "labels"]
+for ds_name, ds_obj in [("train", train_ds), ("val", val_ds), ("test_no_neutral", test_non_neutral)]:
+    missing = [c for c in required_columns if c not in ds_obj.column_names]
+    if missing:
+        raise ValueError(f"{ds_name}: mancano colonne richieste {missing}, trovate {ds_obj.column_names}")
+    ds_obj.set_format(type="torch", columns=required_columns)
+
+# =========================
+# Class weights
+# =========================
+labels_array = np.array(train_ds["labels"])
+class_counts = np.bincount(labels_array, minlength=num_labels)
+class_weights = 1.0 / np.maximum(class_counts, 1)
+class_weights = class_weights / class_weights.sum() * num_labels
+class_weights = np.minimum(class_weights, MAX_CLASS_WEIGHT)
+class_weights_tensor = torch.tensor(class_weights, dtype=torch.float).to(device)
+print("⚖️  Class weights (capped):", class_weights)
+
+# =========================
+# Modello con pesi nella loss
+# =========================
+class WeightedModel(nn.Module):
+    def __init__(self, base_model_name, num_labels, id2label, label2id, class_weights):
+        super().__init__()
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            base_model_name,
+            num_labels=num_labels,
+            id2label=id2label,
+            label2id=label2id
+        )
+        self.loss_fct = nn.CrossEntropyLoss(weight=class_weights)
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+        if labels is not None:
+            loss = self.loss_fct(outputs.logits, labels)
+            return {"loss": loss, "logits": outputs.logits}
+        return outputs
+
+model = WeightedModel(BASE_MODEL, num_labels, ID2LABEL, LABEL2ID, class_weights_tensor).to(device)
+
+# =========================
+# Metriche
+# =========================
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=-1)
+    acc = accuracy_score(labels, preds)
+    macro_f1 = f1_score(labels, preds, average="macro", zero_division=0)
+    return {"accuracy": acc, "macro_f1": macro_f1}
+
+# =========================
+# Training args (Windows-friendly)
+# =========================
+train_steps_per_epoch = math.ceil(len(train_ds) / BATCH_SIZE_TRAIN)
+total_train_steps = train_steps_per_epoch * NUM_EPOCHS
+warmup_steps = int(total_train_steps * WARMUP_RATIO)
+
+args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=BATCH_SIZE_TRAIN,
+    per_device_eval_batch_size=BATCH_SIZE_EVAL,
+    learning_rate=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY,
+    num_train_epochs=NUM_EPOCHS,
+    warmup_steps=warmup_steps,
+    logging_steps=LOG_STEPS,
+    eval_strategy="steps",
+    eval_steps=EVAL_STEPS,
+    save_steps=SAVE_STEPS,
+    save_total_limit=3,
+    load_best_model_at_end=True,
+    metric_for_best_model="macro_f1",
+    greater_is_better=True,
+    report_to="none",
+    fp16=(device == "cuda"),
+    dataloader_pin_memory=True,
+    dataloader_num_workers=0  # FIX Windows
+)
+
+# =========================
+# Trainer
+# =========================
+callbacks = [EarlyStoppingCallback(early_stopping_patience=EARLY_STOP_PATIENCE)]
+
 trainer = Trainer(
     model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=test_dataset,
-    tokenizer=tokenizer,
-    callbacks=[early_stopping],  # Use early stopping during training
+    args=args,
+    train_dataset=train_ds,
+    eval_dataset=val_ds,
+    compute_metrics=compute_metrics,
+    data_collator=default_data_collator,
+    callbacks=callbacks
 )
 
-# Start training the model. If a checkpoint exists, resume from it
-trainer.train(resume_from_checkpoint=resume_checkpoint)
+# =========================
+# Train
+# =========================
+print(f"🚀 Training: {len(train_ds)} train, {len(val_ds)} val, {len(test_non_neutral)} test (NO neutral)")
+train_result = trainer.train()
 
-# Save the final fine-tuned model and tokenizer to a specific directory on Google Drive
-model.save_pretrained("/content/drive/MyDrive/fine_tuned_model")
-tokenizer.save_pretrained("/content/drive/MyDrive/fine_tuned_model")
+# =========================
+# Test finale
+# =========================
+print("🧪 Test finale…")
+test_metrics = trainer.evaluate(test_non_neutral, metric_key_prefix="test")
+print(test_metrics)
 
-# Print a confirmation message once training and saving are complete
-print("✅ Fine-tuning complete! Model saved at 'MyDrive/fine_tuned_model'")
+# =========================
+# Save
+# =========================
+trainer.save_model(OUTPUT_DIR)
+tokenizer.save_pretrained(OUTPUT_DIR)
+
+with open(os.path.join(OUTPUT_DIR, "labels.json"), "w", encoding="utf-8") as f:
+    json.dump({
+        "labels": non_neutral_labels,
+        "label2id": LABEL2ID,
+        "id2label": {str(k): v for k, v in ID2LABEL.items()}
+    }, f, indent=2, ensure_ascii=False)
+
+print("✅ Training completato.")
+print("   Metriche test:", test_metrics)
